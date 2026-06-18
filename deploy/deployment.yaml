@@ -20,12 +20,13 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-          envFrom:
-            - secretRef:
-                name: ha-todo-publisher-secrets
           env:
-            - name: BIND_ADDR
-              value: "0.0.0.0:8080"
+            - name: CONFIG_PATH
+              value: /config/config.toml
+          volumeMounts:
+            - name: config
+              mountPath: /config
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -45,3 +46,7 @@ spec:
             runAsUser: 10001
             capabilities:
               drop: ["ALL"]
+      volumes:
+        - name: config
+          secret:
+            secretName: ha-todo-publisher-config

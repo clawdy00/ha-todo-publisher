@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env, net::SocketAddr, sync::Arc};
+use std::{collections::BTreeMap, env, fs, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{bail, Context};
 use axum::{
@@ -32,20 +32,67 @@ struct Config {
     read_tokens: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FileConfig {
+    #[serde(default = "default_bind_addr")]
+    bind_addr: String,
+    todos: BTreeMap<String, TodoConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TodoConfig {
+    write_token: String,
+    read_token: String,
+}
+
 impl Config {
     fn from_env() -> anyhow::Result<Self> {
-        let bind = env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
+        let path = config_path();
+        Self::from_path(&path)
+            .with_context(|| format!("failed to load config from {}", path.display()))
+    }
+
+    fn from_path(path: &PathBuf) -> anyhow::Result<Self> {
+        let raw = fs::read_to_string(path).with_context(|| "failed to read config file")?;
+        let file: FileConfig =
+            toml::from_str(&raw).with_context(|| "failed to parse TOML config")?;
+        Self::from_file(file)
+    }
+
+    fn from_file(file: FileConfig) -> anyhow::Result<Self> {
+        if file.todos.is_empty() {
+            bail!("config must contain at least one [todos.<slug>] entry");
+        }
+        let bind = file
+            .bind_addr
             .parse()
-            .context("BIND_ADDR must be host:port")?;
-        let write_tokens = parse_scoped_tokens("WRITE_TOKENS", &required_env("WRITE_TOKENS")?)?;
-        let read_tokens = parse_scoped_tokens("READ_TOKENS", &required_env("READ_TOKENS")?)?;
+            .context("bind_addr must be host:port")?;
+        let mut write_tokens = BTreeMap::new();
+        let mut read_tokens = BTreeMap::new();
+        for (slug, todo) in file.todos {
+            validate_slug(&slug)
+                .map_err(|e| anyhow::anyhow!("invalid todo slug {slug}: {}", e.msg))?;
+            validate_token("write_token", &slug, &todo.write_token)?;
+            validate_token("read_token", &slug, &todo.read_token)?;
+            write_tokens.insert(slug.clone(), todo.write_token);
+            read_tokens.insert(slug, todo.read_token);
+        }
         Ok(Self {
             bind,
             write_tokens,
             read_tokens,
         })
     }
+}
+
+fn config_path() -> PathBuf {
+    env::var_os("CONFIG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config.toml"))
+}
+
+fn default_bind_addr() -> String {
+    "0.0.0.0:8080".to_string()
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -259,25 +306,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-fn parse_scoped_tokens(env_name: &str, raw: &str) -> anyhow::Result<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
-    for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (slug, token) = part
-            .split_once(':')
-            .with_context(|| format!("{env_name} entries must be slug:token"))?;
-        validate_slug(slug)
-            .map_err(|e| anyhow::anyhow!("invalid {env_name} slug {slug}: {}", e.msg))?;
-        if token.len() < 24 {
-            bail!("{env_name} token for {slug} must be at least 24 characters");
-        }
-        if out.insert(slug.to_string(), token.to_string()).is_some() {
-            bail!("{env_name} contains duplicate slug {slug}");
-        }
+fn validate_token(field: &str, slug: &str, token: &str) -> anyhow::Result<()> {
+    if token.len() < 24 {
+        bail!("{field} for {slug} must be at least 24 characters");
     }
-    if out.is_empty() {
-        bail!("{env_name} must contain at least one slug:token entry");
-    }
-    Ok(out)
+    Ok(())
 }
 
 fn validate_slug(slug: &str) -> Result<(), AppError> {
@@ -337,32 +370,58 @@ impl IntoResponse for AppError {
     }
 }
 
-fn required_env(name: &str) -> anyhow::Result<String> {
-    env::var(name).with_context(|| format!("{name} is required"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_scoped_tokens() {
-        let tokens = parse_scoped_tokens(
-            "READ_TOKENS",
-            "cars:abcdefghijklmnopqrstuvwxyz,shopping:123456789012345678901234",
-        )
-        .unwrap();
-        assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens["cars"], "abcdefghijklmnopqrstuvwxyz");
+    fn test_file_config() -> FileConfig {
+        FileConfig {
+            bind_addr: "127.0.0.1:8080".to_string(),
+            todos: BTreeMap::from([
+                (
+                    "cars".to_string(),
+                    TodoConfig {
+                        write_token: "w".repeat(32),
+                        read_token: "r".repeat(32),
+                    },
+                ),
+                (
+                    "shopping".to_string(),
+                    TodoConfig {
+                        write_token: "x".repeat(32),
+                        read_token: "y".repeat(32),
+                    },
+                ),
+            ]),
+        }
     }
 
     #[test]
-    fn rejects_duplicate_slugs() {
-        assert!(parse_scoped_tokens(
-            "READ_TOKENS",
-            "cars:abcdefghijklmnopqrstuvwxyz,cars:123456789012345678901234",
-        )
-        .is_err());
+    fn parses_file_config() {
+        let cfg = Config::from_file(test_file_config()).unwrap();
+        assert_eq!(cfg.write_tokens.len(), 2);
+        assert_eq!(cfg.read_tokens["cars"], "r".repeat(32));
+    }
+
+    #[test]
+    fn parses_toml_config() {
+        let raw = r#"
+bind_addr = "127.0.0.1:8080"
+
+[todos.cars]
+write_token = "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+read_token = "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+"#;
+        let file: FileConfig = toml::from_str(raw).unwrap();
+        let cfg = Config::from_file(file).unwrap();
+        assert!(cfg.write_tokens.contains_key("cars"));
+    }
+
+    #[test]
+    fn rejects_short_tokens() {
+        let mut file = test_file_config();
+        file.todos.get_mut("cars").unwrap().read_token = "short".to_string();
+        assert!(Config::from_file(file).is_err());
     }
 
     #[test]

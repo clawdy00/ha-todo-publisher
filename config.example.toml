@@ -1,0 +1,5 @@
+bind_addr = "0.0.0.0:8080"
+
+[todos.cars]
+write_token = "replace-with-generated-cars-write-secret"
+read_token = "replace-with-generated-cars-read-secret"
