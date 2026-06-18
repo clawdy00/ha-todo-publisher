@@ -1,9 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    env,
-    net::SocketAddr,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, env, net::SocketAddr, sync::Arc};
 
 use anyhow::{bail, Context};
 use axum::{
@@ -12,7 +7,7 @@ use axum::{
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
     Json, Router,
 };
 use chrono::{DateTime, Utc};
@@ -33,20 +28,8 @@ struct AppState {
 #[derive(Debug, Clone)]
 struct Config {
     bind: SocketAddr,
-    write_token: String,
-    read_tokens: BTreeMap<String, ReadToken>,
-}
-
-#[derive(Debug, Clone)]
-struct ReadToken {
-    token: String,
-    namespaces: BTreeSet<String>,
-}
-
-impl ReadToken {
-    fn allows(&self, namespace: &str) -> bool {
-        self.namespaces.contains("*") || self.namespaces.contains(namespace)
-    }
+    write_tokens: BTreeMap<String, String>,
+    read_tokens: BTreeMap<String, String>,
 }
 
 impl Config {
@@ -55,14 +38,11 @@ impl Config {
             .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
             .parse()
             .context("BIND_ADDR must be host:port")?;
-        let write_token = required_env("WRITE_TOKEN")?;
-        if write_token.len() < 24 {
-            bail!("WRITE_TOKEN must be at least 24 characters");
-        }
-        let read_tokens = parse_read_tokens(&required_env("READ_TOKENS")?)?;
+        let write_tokens = parse_scoped_tokens("WRITE_TOKENS", &required_env("WRITE_TOKENS")?)?;
+        let read_tokens = parse_scoped_tokens("READ_TOKENS", &required_env("READ_TOKENS")?)?;
         Ok(Self {
             bind,
-            write_token,
+            write_tokens,
             read_tokens,
         })
     }
@@ -71,14 +51,14 @@ impl Config {
 #[derive(Debug, Default, Clone, Serialize)]
 struct TodoStore {
     updated_at: Option<DateTime<Utc>>,
-    namespaces: BTreeMap<String, NamespaceTodos>,
+    lists: BTreeMap<String, PublishedTodoList>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct NamespaceTodos {
-    namespace: String,
+struct PublishedTodoList {
+    slug: String,
     updated_at: DateTime<Utc>,
-    lists: Vec<TodoList>,
+    list: TodoList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,16 +86,10 @@ struct TodoItem {
 
 #[derive(Debug, Deserialize)]
 struct IngestPayload {
-    namespace: String,
     #[serde(default)]
     updated_at: Option<DateTime<Utc>>,
-    lists: Vec<TodoList>,
-}
-
-#[derive(Debug, Serialize)]
-struct ApiResponse {
-    updated_at: Option<DateTime<Utc>>,
-    namespaces: BTreeMap<String, NamespaceTodos>,
+    #[serde(flatten)]
+    list: TodoList,
 }
 
 #[tokio::main]
@@ -141,13 +115,10 @@ async fn main() -> anyhow::Result<()> {
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/api/todos", get(all_todos))
-        .route("/api/todos/:namespace", get(namespace_todos))
-        .route("/api/ingest", post(ingest))
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(|request: &Request<_>| tracing::info_span!("request", method = %request.method(), uri = %request.uri()))
-        )
+        .route("/api/todos/:slug", get(read_todo).post(write_todo))
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
+            tracing::info_span!("request", method = %request.method(), uri = %request.uri())
+        }))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
@@ -163,99 +134,69 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "ok": true,
         "updated_at": store.updated_at,
-        "namespaces": store.namespaces.len(),
+        "lists": store.lists.len(),
     }))
 }
 
-async fn all_todos(
+async fn read_todo(
     State(state): State<AppState>,
+    Path(slug): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<ApiResponse>, AppError> {
-    let scope = read_scope_for_headers(&state.cfg, &headers)
-        .ok_or(AppError::unauthorized("missing or invalid read token"))?;
+) -> Result<Json<PublishedTodoList>, AppError> {
+    validate_slug(&slug)?;
+    verify_scoped_bearer(&state.cfg.read_tokens, &slug, &headers, "read")?;
     let store = state.store.read().await;
-    let namespaces = store
-        .namespaces
-        .iter()
-        .filter(|(name, _)| scope.allows(name))
-        .map(|(name, todos)| (name.clone(), todos.clone()))
-        .collect();
-    Ok(Json(ApiResponse {
-        updated_at: store.updated_at,
-        namespaces,
-    }))
-}
-
-async fn namespace_todos(
-    State(state): State<AppState>,
-    Path(namespace): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<NamespaceTodos>, AppError> {
-    let scope = read_scope_for_headers(&state.cfg, &headers)
-        .ok_or(AppError::unauthorized("missing or invalid read token"))?;
-    if !scope.allows(&namespace) {
-        return Err(AppError::forbidden(
-            "read token is not allowed for namespace",
-        ));
-    }
-    let store = state.store.read().await;
-    let todos = store
-        .namespaces
-        .get(&namespace)
+    let list = store
+        .lists
+        .get(&slug)
         .cloned()
-        .ok_or(AppError::not_found("namespace not found"))?;
-    Ok(Json(todos))
+        .ok_or(AppError::not_found("todo list not found"))?;
+    Ok(Json(list))
 }
 
-async fn ingest(
+async fn write_todo(
     State(state): State<AppState>,
+    Path(slug): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    verify_write_auth(&state.cfg, &headers, &body)?;
+    validate_slug(&slug)?;
+    verify_write_auth(&state.cfg, &slug, &headers, &body)?;
     let payload: IngestPayload = serde_json::from_slice(&body).map_err(AppError::bad_request)?;
-    validate_namespace(&payload.namespace)?;
     let updated_at = payload.updated_at.unwrap_or_else(Utc::now);
-    let namespace = NamespaceTodos {
-        namespace: payload.namespace.clone(),
+    let published = PublishedTodoList {
+        slug: slug.clone(),
         updated_at,
-        lists: payload.lists,
+        list: payload.list,
     };
     let mut store = state.store.write().await;
     store.updated_at = Some(Utc::now());
-    store
-        .namespaces
-        .insert(payload.namespace.clone(), namespace);
+    store.lists.insert(slug.clone(), published);
     Ok(Json(serde_json::json!({
         "ok": true,
-        "namespace": payload.namespace,
+        "slug": slug,
         "updated_at": updated_at,
     })))
 }
 
 async fn auth_middleware(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    if path == "/healthz" || path == "/api/ingest" {
+    if path == "/healthz" || path.starts_with("/api/todos/") {
         return next.run(req).await;
     }
-    match bearer_token(req.headers()) {
-        Some(token) if read_scope_for_token(&state.cfg.read_tokens, token).is_some() => {
-            next.run(req).await
-        }
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "missing or invalid read token\n",
-        )
-            .into_response(),
-    }
+    (StatusCode::NOT_FOUND, "not found\n").into_response()
 }
 
-fn verify_write_auth(cfg: &Config, headers: &HeaderMap, body: &[u8]) -> Result<(), AppError> {
+fn verify_write_auth(
+    cfg: &Config,
+    slug: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), AppError> {
     if let Some(sig) = headers
         .get("x-ha-signature-256")
         .and_then(|v| v.to_str().ok())
@@ -263,16 +204,36 @@ fn verify_write_auth(cfg: &Config, headers: &HeaderMap, body: &[u8]) -> Result<(
         let Some(hex_sig) = sig.strip_prefix("sha256=") else {
             return Err(AppError::unauthorized("invalid signature format"));
         };
-        let expected = hmac_sha256_hex(cfg.write_token.as_bytes(), body);
+        let Some(token) = cfg.write_tokens.get(slug) else {
+            return Err(AppError::forbidden("no write token configured for slug"));
+        };
+        let expected = hmac_sha256_hex(token.as_bytes(), body);
         if expected.as_bytes().ct_eq(hex_sig.as_bytes()).into() {
             return Ok(());
         }
         return Err(AppError::unauthorized("invalid signature"));
     }
 
-    match bearer_token(headers) {
-        Some(token) if constant_time_eq(token.as_bytes(), cfg.write_token.as_bytes()) => Ok(()),
-        _ => Err(AppError::unauthorized("missing or invalid write token")),
+    verify_scoped_bearer(&cfg.write_tokens, slug, headers, "write")
+}
+
+fn verify_scoped_bearer(
+    tokens: &BTreeMap<String, String>,
+    slug: &str,
+    headers: &HeaderMap,
+    kind: &str,
+) -> Result<(), AppError> {
+    let supplied = bearer_token(headers)
+        .ok_or_else(|| AppError::unauthorized(format!("missing or invalid {kind} token")))?;
+    let expected = tokens
+        .get(slug)
+        .ok_or_else(|| AppError::forbidden(format!("no {kind} token configured for slug")))?;
+    if constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(AppError::unauthorized(format!(
+            "missing or invalid {kind} token"
+        )))
     }
 }
 
@@ -298,88 +259,38 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-fn read_scope_for_headers<'a>(cfg: &'a Config, headers: &HeaderMap) -> Option<&'a ReadToken> {
-    read_scope_for_token(&cfg.read_tokens, bearer_token(headers)?)
-}
-
-fn read_scope_for_token<'a>(
-    tokens: &'a BTreeMap<String, ReadToken>,
-    supplied: &str,
-) -> Option<&'a ReadToken> {
-    let mut matched = None;
-    for entry in tokens.values() {
-        if constant_time_eq(entry.token.as_bytes(), supplied.as_bytes()) {
-            matched = Some(entry);
-        }
-    }
-    matched
-}
-
-fn parse_read_tokens(raw: &str) -> anyhow::Result<BTreeMap<String, ReadToken>> {
+fn parse_scoped_tokens(env_name: &str, raw: &str) -> anyhow::Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let mut fields = part.splitn(3, ':');
-        let name = fields
-            .next()
-            .context("READ_TOKENS entries must be name:token:namespace[+namespace]")?;
-        let token = fields
-            .next()
-            .context("READ_TOKENS entries must be name:token:namespace[+namespace]")?;
-        let namespaces_raw = fields
-            .next()
-            .context("READ_TOKENS entries must be name:token:namespace[+namespace]")?;
+        let (slug, token) = part
+            .split_once(':')
+            .with_context(|| format!("{env_name} entries must be slug:token"))?;
+        validate_slug(slug)
+            .map_err(|e| anyhow::anyhow!("invalid {env_name} slug {slug}: {}", e.msg))?;
         if token.len() < 24 {
-            bail!("READ_TOKENS token for {name} must be at least 24 characters");
+            bail!("{env_name} token for {slug} must be at least 24 characters");
         }
-        validate_token_name(name)
-            .map_err(|e| anyhow::anyhow!("invalid READ_TOKENS name {name}: {}", e.msg))?;
-        let namespaces = parse_allowed_namespaces(name, namespaces_raw)?;
-        out.insert(
-            name.to_string(),
-            ReadToken {
-                token: token.to_string(),
-                namespaces,
-            },
-        );
+        if out.insert(slug.to_string(), token.to_string()).is_some() {
+            bail!("{env_name} contains duplicate slug {slug}");
+        }
     }
     if out.is_empty() {
-        bail!("READ_TOKENS must contain at least one name:token:namespace entry");
+        bail!("{env_name} must contain at least one slug:token entry");
     }
     Ok(out)
 }
 
-fn parse_allowed_namespaces(name: &str, raw: &str) -> anyhow::Result<BTreeSet<String>> {
-    let mut namespaces = BTreeSet::new();
-    for namespace in raw.split('+').map(str::trim).filter(|s| !s.is_empty()) {
-        if namespace == "*" {
-            namespaces.insert(namespace.to_string());
-        } else {
-            validate_namespace(namespace).map_err(|e| {
-                anyhow::anyhow!(
-                    "invalid namespace {namespace} for READ_TOKENS name {name}: {}",
-                    e.msg
-                )
-            })?;
-            namespaces.insert(namespace.to_string());
-        }
-    }
-    if namespaces.is_empty() {
-        bail!("READ_TOKENS entry {name} must allow at least one namespace");
-    }
-    Ok(namespaces)
-}
-
-fn validate_namespace(ns: &str) -> Result<(), AppError> {
-    let ok = !ns.is_empty()
-        && ns.len() <= 64
-        && ns
+fn validate_slug(slug: &str) -> Result<(), AppError> {
+    let ok = !slug.is_empty()
+        && slug.len() <= 64
+        && slug
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
     if ok {
         Ok(())
     } else {
         Err(AppError::bad_request_msg(
-            "namespace must be 1-64 chars of lowercase letters, digits, '-' or '_'",
+            "slug must be 1-64 chars of lowercase letters, digits, '-' or '_'",
         ))
     }
 }
@@ -430,37 +341,36 @@ fn required_env(name: &str) -> anyhow::Result<String> {
     env::var(name).with_context(|| format!("{name} is required"))
 }
 
-fn validate_token_name(name: &str) -> Result<(), AppError> {
-    validate_namespace(name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_read_tokens() {
-        let tokens = parse_read_tokens(
-            "trmnl:abcdefghijklmnopqrstuvwxyz:shopping,wall:123456789012345678901234:home+shopping",
+    fn parses_scoped_tokens() {
+        let tokens = parse_scoped_tokens(
+            "READ_TOKENS",
+            "cars:abcdefghijklmnopqrstuvwxyz,shopping:123456789012345678901234",
         )
         .unwrap();
         assert_eq!(tokens.len(), 2);
-        assert!(tokens["trmnl"].allows("shopping"));
-        assert!(!tokens["trmnl"].allows("home"));
-        assert!(tokens["wall"].allows("home"));
-        assert!(tokens["wall"].allows("shopping"));
+        assert_eq!(tokens["cars"], "abcdefghijklmnopqrstuvwxyz");
     }
 
     #[test]
-    fn rejects_read_tokens_without_scope() {
-        assert!(parse_read_tokens("trmnl:abcdefghijklmnopqrstuvwxyz").is_err());
+    fn rejects_duplicate_slugs() {
+        assert!(parse_scoped_tokens(
+            "READ_TOKENS",
+            "cars:abcdefghijklmnopqrstuvwxyz,cars:123456789012345678901234",
+        )
+        .is_err());
     }
 
     #[test]
-    fn rejects_bad_namespace() {
-        assert!(validate_namespace("home").is_ok());
-        assert!(validate_namespace("Home").is_err());
-        assert!(validate_namespace("../../x").is_err());
+    fn rejects_bad_slug() {
+        assert!(validate_slug("cars").is_ok());
+        assert!(validate_slug("car_tasks").is_ok());
+        assert!(validate_slug("Cars").is_err());
+        assert!(validate_slug("../../x").is_err());
     }
 
     #[test]
