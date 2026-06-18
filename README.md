@@ -2,19 +2,22 @@
 
 A small push-based Rust web service for publishing Home Assistant to-do lists without giving an external service a broad Home Assistant long-lived access token.
 
-Home Assistant owns the data and pushes snapshots to this service whenever a configured to-do list changes. Consumers then read a simple JSON API using separate read tokens.
+Home Assistant owns the data and pushes snapshots to this service whenever a configured to-do list changes. Consumers then read a simple JSON API using separate namespace-scoped read tokens.
 
 ## Why push instead of polling Home Assistant?
 
 Home Assistant long-lived access tokens are too broad for this use case. This service avoids storing any Home Assistant credential. Instead:
 
 - Home Assistant sends `POST /api/ingest` with a service-specific write token.
-- Readers call `GET /api/todos` or `GET /api/todos/{namespace}` with separate read tokens.
+- Readers call `GET /api/todos` or `GET /api/todos/{namespace}` with read tokens scoped to one or more namespaces.
 - The app stores only the latest in-memory snapshot per namespace.
 
 No personal to-do contents are committed to this repository.
 
 ## API
+
+The service is JSON-only. It has no human-facing HTML page.
+
 
 ### Write: ingest a namespace snapshot
 
@@ -58,19 +61,51 @@ X-HA-Signature-256: sha256=<hex hmac sha256 over raw request body using WRITE_TO
 
 If this header is present, it is verified instead of bearer auth. The bearer-token mode is the practical default for Home Assistant YAML because stock templates do not conveniently calculate HMAC.
 
-### Read all namespaces
+### Read allowed namespaces
 
 ```http
 GET /api/todos
-Authorization: Bearer <read-token>
+Authorization: Bearer ***
+```
+
+Returns only the namespaces allowed by the presented read token. The response shape remains stable for consumers:
+
+```json
+{
+  "updated_at": "2026-01-01T00:00:00Z",
+  "namespaces": {
+    "shopping": {
+      "namespace": "shopping",
+      "updated_at": "2026-01-01T00:00:00Z",
+      "lists": [
+        {
+          "id": "todo.example",
+          "name": "Example list",
+          "items": [
+            {
+              "id": "item-1",
+              "summary": "Example task",
+              "status": "needs_action",
+              "due": null,
+              "description": null,
+              "url": null
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
 ```
 
 ### Read one namespace
 
 ```http
-GET /api/todos/home
-Authorization: Bearer <read-token>
+GET /api/todos/shopping
+Authorization: Bearer ***
 ```
+
+Returns `403` if the token is valid but not allowed for that namespace.
 
 ### Health
 
@@ -86,8 +121,7 @@ Environment variables:
 | --- | --- | --- | --- |
 | `BIND_ADDR` | no | `0.0.0.0:8080` | Listen address. |
 | `WRITE_TOKEN` | yes | generated secret | Minimum 24 chars. Used only by Home Assistant writes. |
-| `READ_TOKENS` | yes | `trmnl:secret1,dashboard:secret2` | Comma-separated `name:token` entries. Each token min 24 chars. |
-| `PUBLIC_HTML` | no | `false` | If `true`, `/` is public. JSON remains token-protected. |
+| `READ_TOKENS` | yes | `trmnl:secret1:shopping,dashboard:secret2:home+shopping` | Comma-separated `name:token:namespace[+namespace]` entries. Each token min 24 chars. Use `*` only for an intentionally all-namespace token. |
 
 Generate local secrets:
 
@@ -99,7 +133,7 @@ Run locally:
 
 ```sh
 export WRITE_TOKEN="$(openssl rand -base64 32)"
-export READ_TOKENS="local:$(openssl rand -base64 32)"
+export READ_TOKENS="local:$(openssl rand -base64 32):home"
 cargo run
 ```
 
@@ -191,7 +225,7 @@ metadata:
 type: Opaque
 stringData:
   WRITE_TOKEN: "replace-with-generated-secret"
-  READ_TOKENS: "dashboard:replace-with-generated-secret,trmnl:replace-with-generated-secret"
+  READ_TOKENS: "dashboard:replace-with-generated-secret:home,trmnl:replace-with-generated-secret:shopping"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -230,6 +264,6 @@ Add a Service and Ingress for your local cluster hostname.
 ## Security notes
 
 - Do not commit real to-do payloads, tokens, screenshots, or Home Assistant hostnames if private.
-- Use one write token for Home Assistant and separate read tokens per consumer.
-- Rotate a read token by replacing it in `READ_TOKENS` and restarting the pod.
+- Use one write token for Home Assistant and separate namespace-scoped read tokens per consumer.
+- Rotate or rescope a read token by replacing its `READ_TOKENS` entry and restarting the pod.
 - The service keeps state in memory only; restart means Home Assistant must push again before data appears.

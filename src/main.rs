@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, env, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use anyhow::{bail, Context};
 use axum::{
@@ -6,13 +11,12 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
-use maud::{html, Markup, DOCTYPE};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -30,8 +34,19 @@ struct AppState {
 struct Config {
     bind: SocketAddr,
     write_token: String,
-    read_tokens: BTreeMap<String, String>,
-    public_html: bool,
+    read_tokens: BTreeMap<String, ReadToken>,
+}
+
+#[derive(Debug, Clone)]
+struct ReadToken {
+    token: String,
+    namespaces: BTreeSet<String>,
+}
+
+impl ReadToken {
+    fn allows(&self, namespace: &str) -> bool {
+        self.namespaces.contains("*") || self.namespaces.contains(namespace)
+    }
 }
 
 impl Config {
@@ -45,12 +60,10 @@ impl Config {
             bail!("WRITE_TOKEN must be at least 24 characters");
         }
         let read_tokens = parse_read_tokens(&required_env("READ_TOKENS")?)?;
-        let public_html = env_bool("PUBLIC_HTML", false)?;
         Ok(Self {
             bind,
             write_token,
             read_tokens,
-            public_html,
         })
     }
 }
@@ -128,7 +141,6 @@ async fn main() -> anyhow::Result<()> {
 fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/", get(index))
         .route("/api/todos", get(all_todos))
         .route("/api/todos/:namespace", get(namespace_todos))
         .route("/api/ingest", post(ingest))
@@ -155,23 +167,37 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn index(State(state): State<AppState>) -> Html<String> {
+async fn all_todos(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ApiResponse>, AppError> {
+    let scope = read_scope_for_headers(&state.cfg, &headers)
+        .ok_or(AppError::unauthorized("missing or invalid read token"))?;
     let store = state.store.read().await;
-    Html(render_index(&store).into_string())
-}
-
-async fn all_todos(State(state): State<AppState>) -> Json<ApiResponse> {
-    let store = state.store.read().await;
-    Json(ApiResponse {
+    let namespaces = store
+        .namespaces
+        .iter()
+        .filter(|(name, _)| scope.allows(name))
+        .map(|(name, todos)| (name.clone(), todos.clone()))
+        .collect();
+    Ok(Json(ApiResponse {
         updated_at: store.updated_at,
-        namespaces: store.namespaces.clone(),
-    })
+        namespaces,
+    }))
 }
 
 async fn namespace_todos(
     State(state): State<AppState>,
     Path(namespace): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<NamespaceTodos>, AppError> {
+    let scope = read_scope_for_headers(&state.cfg, &headers)
+        .ok_or(AppError::unauthorized("missing or invalid read token"))?;
+    if !scope.allows(&namespace) {
+        return Err(AppError::forbidden(
+            "read token is not allowed for namespace",
+        ));
+    }
     let store = state.store.read().await;
     let todos = store
         .namespaces
@@ -213,11 +239,13 @@ async fn auth_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    if path == "/healthz" || path == "/api/ingest" || (path == "/" && state.cfg.public_html) {
+    if path == "/healthz" || path == "/api/ingest" {
         return next.run(req).await;
     }
     match bearer_token(req.headers()) {
-        Some(token) if token_allowed(&state.cfg.read_tokens, token) => next.run(req).await,
+        Some(token) if read_scope_for_token(&state.cfg.read_tokens, token).is_some() => {
+            next.run(req).await
+        }
         _ => (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -270,29 +298,75 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-fn token_allowed(tokens: &BTreeMap<String, String>, supplied: &str) -> bool {
-    tokens
-        .values()
-        .any(|token| constant_time_eq(token.as_bytes(), supplied.as_bytes()))
+fn read_scope_for_headers<'a>(cfg: &'a Config, headers: &HeaderMap) -> Option<&'a ReadToken> {
+    read_scope_for_token(&cfg.read_tokens, bearer_token(headers)?)
 }
 
-fn parse_read_tokens(raw: &str) -> anyhow::Result<BTreeMap<String, String>> {
+fn read_scope_for_token<'a>(
+    tokens: &'a BTreeMap<String, ReadToken>,
+    supplied: &str,
+) -> Option<&'a ReadToken> {
+    let mut matched = None;
+    for entry in tokens.values() {
+        if constant_time_eq(entry.token.as_bytes(), supplied.as_bytes()) {
+            matched = Some(entry);
+        }
+    }
+    matched
+}
+
+fn parse_read_tokens(raw: &str) -> anyhow::Result<BTreeMap<String, ReadToken>> {
     let mut out = BTreeMap::new();
     for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (name, token) = part
-            .split_once(':')
-            .context("READ_TOKENS entries must be name:token")?;
+        let mut fields = part.splitn(3, ':');
+        let name = fields
+            .next()
+            .context("READ_TOKENS entries must be name:token:namespace[+namespace]")?;
+        let token = fields
+            .next()
+            .context("READ_TOKENS entries must be name:token:namespace[+namespace]")?;
+        let namespaces_raw = fields
+            .next()
+            .context("READ_TOKENS entries must be name:token:namespace[+namespace]")?;
         if token.len() < 24 {
             bail!("READ_TOKENS token for {name} must be at least 24 characters");
         }
-        validate_namespace(name)
+        validate_token_name(name)
             .map_err(|e| anyhow::anyhow!("invalid READ_TOKENS name {name}: {}", e.msg))?;
-        out.insert(name.to_string(), token.to_string());
+        let namespaces = parse_allowed_namespaces(name, namespaces_raw)?;
+        out.insert(
+            name.to_string(),
+            ReadToken {
+                token: token.to_string(),
+                namespaces,
+            },
+        );
     }
     if out.is_empty() {
-        bail!("READ_TOKENS must contain at least one name:token entry");
+        bail!("READ_TOKENS must contain at least one name:token:namespace entry");
     }
     Ok(out)
+}
+
+fn parse_allowed_namespaces(name: &str, raw: &str) -> anyhow::Result<BTreeSet<String>> {
+    let mut namespaces = BTreeSet::new();
+    for namespace in raw.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+        if namespace == "*" {
+            namespaces.insert(namespace.to_string());
+        } else {
+            validate_namespace(namespace).map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid namespace {namespace} for READ_TOKENS name {name}: {}",
+                    e.msg
+                )
+            })?;
+            namespaces.insert(namespace.to_string());
+        }
+    }
+    if namespaces.is_empty() {
+        bail!("READ_TOKENS entry {name} must allow at least one namespace");
+    }
+    Ok(namespaces)
 }
 
 fn validate_namespace(ns: &str) -> Result<(), AppError> {
@@ -309,72 +383,6 @@ fn validate_namespace(ns: &str) -> Result<(), AppError> {
         ))
     }
 }
-
-fn render_index(store: &TodoStore) -> Markup {
-    html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                meta name="viewport" content="width=device-width, initial-scale=1";
-                title { "Home Assistant Todos" }
-                style { (STYLE) }
-            }
-            body {
-                main {
-                    header {
-                        h1 { "Todos" }
-                        @if let Some(ts) = store.updated_at {
-                            p class="muted" { "Updated " (ts.to_rfc3339()) }
-                        } @else {
-                            p class="muted" { "No data received yet." }
-                        }
-                    }
-                    @for (name, ns) in &store.namespaces {
-                        section class="namespace" {
-                            h2 { (name) }
-                            p class="muted" { "Namespace updated " (ns.updated_at.to_rfc3339()) }
-                            @for list in &ns.lists {
-                                article class="list" {
-                                    h3 { (list.name.as_deref().unwrap_or(&list.id)) }
-                                    @if list.items.is_empty() {
-                                        p class="muted" { "No items" }
-                                    } @else {
-                                        ul {
-                                            @for item in &list.items {
-                                                li {
-                                                    span class="summary" { (item.summary) }
-                                                    @if let Some(due) = &item.due { span class="due" { (due) } }
-                                                    @if let Some(status) = &item.status { span class="status" { (status) } }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-const STYLE: &str = r#"
-:root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; }
-body { margin: 0; background: #101318; color: #eef2f7; }
-main { max-width: 760px; margin: 0 auto; padding: 24px; }
-h1 { margin: 0 0 4px; font-size: 2rem; }
-h2 { margin-top: 32px; border-bottom: 1px solid #303642; padding-bottom: 8px; }
-h3 { margin: 0 0 12px; }
-.muted { color: #9aa4b2; }
-.list { background: #171c24; border: 1px solid #2b3340; border-radius: 14px; padding: 16px; margin: 12px 0; }
-ul { list-style: none; margin: 0; padding: 0; }
-li { display: flex; gap: 8px; align-items: baseline; padding: 9px 0; border-top: 1px solid #252b35; }
-li:first-child { border-top: 0; }
-.summary { flex: 1; }
-.due, .status { color: #a7b3c4; font-size: .85rem; border: 1px solid #374151; border-radius: 999px; padding: 2px 8px; }
-"#;
 
 #[derive(Debug)]
 struct AppError {
@@ -398,6 +406,12 @@ impl AppError {
             msg: msg.into(),
         }
     }
+    fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            msg: msg.into(),
+        }
+    }
     fn not_found(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -416,15 +430,8 @@ fn required_env(name: &str) -> anyhow::Result<String> {
     env::var(name).with_context(|| format!("{name} is required"))
 }
 
-fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
-    match env::var(name) {
-        Ok(v) => match v.as_str() {
-            "1" | "true" | "TRUE" | "yes" | "YES" => Ok(true),
-            "0" | "false" | "FALSE" | "no" | "NO" => Ok(false),
-            _ => bail!("{name} must be boolean"),
-        },
-        Err(_) => Ok(default),
-    }
+fn validate_token_name(name: &str) -> Result<(), AppError> {
+    validate_namespace(name)
 }
 
 #[cfg(test)]
@@ -433,10 +440,20 @@ mod tests {
 
     #[test]
     fn parses_read_tokens() {
-        let tokens =
-            parse_read_tokens("trmnl:abcdefghijklmnopqrstuvwxyz,wall:123456789012345678901234")
-                .unwrap();
+        let tokens = parse_read_tokens(
+            "trmnl:abcdefghijklmnopqrstuvwxyz:shopping,wall:123456789012345678901234:home+shopping",
+        )
+        .unwrap();
         assert_eq!(tokens.len(), 2);
+        assert!(tokens["trmnl"].allows("shopping"));
+        assert!(!tokens["trmnl"].allows("home"));
+        assert!(tokens["wall"].allows("home"));
+        assert!(tokens["wall"].allows("shopping"));
+    }
+
+    #[test]
+    fn rejects_read_tokens_without_scope() {
+        assert!(parse_read_tokens("trmnl:abcdefghijklmnopqrstuvwxyz").is_err());
     }
 
     #[test]

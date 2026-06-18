@@ -26,8 +26,6 @@ spec:
           env:
             - name: BIND_ADDR
               value: "0.0.0.0:8080"
-            - name: PUBLIC_HTML
-              value: "false"
           readinessProbe:
             httpGet:
               path: /healthz
