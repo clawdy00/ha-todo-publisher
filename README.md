@@ -1,5 +1,7 @@
 # Home Assistant Todo Publisher
 
+> **Superseded:** this project has been replaced by [nsg/jsonhost](https://github.com/nsg/jsonhost). Use that repository for the current implementation.
+
 A small push-based Rust web service for publishing individual Home Assistant to-do lists without giving consumers any Home Assistant credentials.
 
 Home Assistant pushes one to-do list snapshot to a slug URL such as `/api/todos/cars`. Consumers read the same slug URL with a separate read secret.
