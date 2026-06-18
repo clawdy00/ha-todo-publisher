@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ha-todo-publisher
+  namespace: ha-todo-publisher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ha-todo-publisher
+  template:
+    metadata:
+      labels:
+        app: ha-todo-publisher
+    spec:
+      containers:
+        - name: app
+          image: ghcr.io/clawdy00/ha-todo-publisher:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: ha-todo-publisher-secrets
+          env:
+            - name: BIND_ADDR
+              value: "0.0.0.0:8080"
+            - name: PUBLIC_HTML
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]

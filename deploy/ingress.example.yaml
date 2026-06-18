@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ha-todo-publisher
+  namespace: ha-todo-publisher
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - todo.example.internal
+      secretName: wildcard-example-internal-tls
+  rules:
+    - host: todo.example.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ha-todo-publisher
+                port:
+                  name: http
